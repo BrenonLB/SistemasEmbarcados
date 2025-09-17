@@ -24,7 +24,7 @@ void app_main(void)
     /* Estrutura para armazenar as informações do esp*/
     esp_chip_info_t chip_info;
 
-    /* Popula a estrutura chip_info com os dados do hardware */
+    /* Mostra a estrutura chip_info com os dados do hardware */
     esp_chip_info(&chip_info);
 
     // Exibe as informações do esp utilizando ESP_LOGI
@@ -40,10 +40,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Features: %s", features);
 
 
-    // Calcula a revisão do silício (major e minor)
+    // Calcula a revisão do esp 
     unsigned major_rev = chip_info.revision / 100;
     unsigned minor_rev = chip_info.revision % 100;
-    ESP_LOGI(TAG, "Revisao do silicio: v%d.%d", major_rev, minor_rev);
+    ESP_LOGI(TAG, "Revisao do esp: v%d.%d", major_rev, minor_rev);
 
     // Variável para armazenar o tamanho da flash
     uint32_t flash_size;
@@ -72,6 +72,6 @@ void app_main(void)
      */
     while(1) {
         ESP_LOGI(TAG, "Programa em execucao. Aguardando...");
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Pausa a task por 1 segundos
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Pausa a task por 1 segundos
     }
 }
