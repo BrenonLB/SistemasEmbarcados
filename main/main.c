@@ -16,7 +16,8 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 
-static const char *TAG = "PRATICA_02_TIMER";
+static const char *TAG1 = "PRATICA_01_LOG";
+static const char *TAG2 = "PRATICA_02_TIMER";
 
 #define LED_AZUL_GPIO   2
 #define BOTAO_0_GPIO    21
@@ -76,23 +77,23 @@ static void button_task(void* arg)
 
     while (true) {
         if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            ESP_LOGI(TAG, "Botao no GPIO %" PRIu32 " acionado e validado!", io_num);
+            ESP_LOGI(TAG2, "Botao no GPIO %" PRIu32 " acionado e validado!", io_num);
 
             switch (io_num) {
                 case BOTAO_1_GPIO:
-                    ESP_LOGI(TAG, "Ligando o LED azul.");
+                    ESP_LOGI(TAG2, "Ligando o LED azul.");
                     led_state = 1;
                     gpio_set_level(LED_AZUL_GPIO, led_state);
                     break;
 
                 case BOTAO_2_GPIO:
-                    ESP_LOGI(TAG, "Desligando o LED azul.");
+                    ESP_LOGI(TAG2, "Desligando o LED azul.");
                     led_state = 0;
                     gpio_set_level(LED_AZUL_GPIO, led_state);
                     break;
 
                 case BOTAO_0_GPIO:
-                    ESP_LOGI(TAG, "Alternando o estado do LED azul.");
+                    ESP_LOGI(TAG2, "Alternando o estado do LED azul.");
                     led_state = !led_state;
                     gpio_set_level(LED_AZUL_GPIO, led_state);
                     break;
@@ -103,7 +104,52 @@ static void button_task(void* arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Iniciando a aplicacao...");
+
+    ESP_LOGI(TAG1, "Iniciando a aplicacao para obter informacoes do esp 32.");
+
+    /* Estrutura para armazenar as informações do esp*/
+    esp_chip_info_t chip_info;
+
+    /* Mostra a estrutura chip_info com os dados do hardware */
+    esp_chip_info(&chip_info);
+
+    // Exibe as informações do esp utilizando ESP_LOGI
+    ESP_LOGI(TAG1, "Este e um esp %s com %d nucleo(s) de CPU.", CONFIG_IDF_TARGET, chip_info.cores);
+    
+    // Constrói uma string com as features do esp para ficar de forma organizada
+    char features[100];
+    snprintf(features, sizeof(features), "%s%s%s%s",
+           (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
+           (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
+           (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
+           (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
+    ESP_LOGI(TAG1, "Features: %s", features);
+
+
+    // Calcula a revisão do esp 
+    unsigned major_rev = chip_info.revision / 100;
+    unsigned minor_rev = chip_info.revision % 100;
+    ESP_LOGI(TAG1, "Revisao do esp: v%d.%d", major_rev, minor_rev);
+
+    // Variável para armazenar o tamanho da flash
+    uint32_t flash_size;
+    // Tenta obter o tamanho da memória flash
+    if (esp_flash_get_size(NULL, &flash_size) == ESP_OK) {
+        ESP_LOGI(TAG1, "Tamanho da flash: %" PRIu32 "MB (%s)", 
+                 flash_size / (uint32_t)(1024 * 1024),
+                 (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embarcada" : "externa");
+    } else {
+        // Log de erro caso não consiga obter o tamanho da flash
+        ESP_LOGE(TAG1, "Falha ao obter o tamanho da memoria flash.");
+    }
+
+    // Exibe o mínimo de memória heap livre que o sistema já atingiu
+    ESP_LOGI(TAG1, "Minimo de heap livre: %" PRIu32 " bytes", esp_get_minimum_free_heap_size());
+
+    // Exibe a versão do ESP-IDF que está sendo utilizada
+    ESP_LOGI(TAG1, "Versao do ESP-IDF: %s", esp_get_idf_version());
+
+    ESP_LOGI(TAG2, "Iniciando a aplicacao...");
 
   
     gpio_reset_pin(LED_AZUL_GPIO);
@@ -135,5 +181,5 @@ void app_main(void)
     gpio_isr_handler_add(BOTAO_1_GPIO, gpio_isr_handler, (void*) BOTAO_1_GPIO);
     gpio_isr_handler_add(BOTAO_2_GPIO, gpio_isr_handler, (void*) BOTAO_2_GPIO);
 
-    ESP_LOGI(TAG, "Configuracao completa. O sistema esta pronto.");
+    ESP_LOGI(TAG2, "Configuracao completa. O sistema esta pronto.");
 }
