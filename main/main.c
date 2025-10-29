@@ -100,7 +100,7 @@ static void button_task(void* arg) {
                     pwm_cmd.set_auto_mode = true;
                     pwm_cmd.increment = 0;
                     break;
-                case 22://Botão para modo manual
+                case 22://Botão modo manual
                     pwm_cmd.set_auto_mode = false;
                     pwm_cmd.increment = -1;
                     break;
