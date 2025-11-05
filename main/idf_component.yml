@@ -1,0 +1,16 @@
+## idf_component.yml
+## COLOQUE ESTE ARQUIVO NA PASTA 'main' DO SEU PROJETO
+## Ele informa ao ESP-IDF para baixar as bibliotecas do display e LVGL.
+
+dependencies:
+  # Driver I2C
+  espressif/i2c_controller: "^1.0"
+  
+  # Driver do display SSD1306 (Item 4b do PDF)
+  espressif/ssd1306: "^2.0"
+  
+  # Biblioteca de gráficos LVGL
+  lvgl/lvgl: "^8.3"
+  
+  # Componente de "ponte" entre ESP32 e LVGL
+  espressif/esp_lvgl_port: "^1.0"
