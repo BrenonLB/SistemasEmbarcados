@@ -7,75 +7,58 @@
 
 #include <stdio.h>
 #include <inttypes.h>
-#include <unistd.h>      // Para usleep
-#include <sys/lock.h>    // Para _lock_t do LVGL
-#include <sys/param.h>   // Para MIN/MAX
-
+#include <unistd.h>      
+#include <sys/lock.h>    
+#include <sys/param.h>   
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
-
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_system.h"
 #include "esp_log.h"
-#include "esp_timer.h"   // Para o tick do LVGL
-
+#include "esp_timer.h"   
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "driver/ledc.h"
 #include "driver/i2c_master.h"
-
-// Includes do ADC
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-
-// Includes do Display e LVGL
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "lvgl.h"
-
-// --- TAGs de Log ---
 static const char *TAG1 = "PRATICA_01_LOG";
 static const char *TAG2 = "PRATICA_02_BUTTON";
 static const char *TAG3 = "PRATICA_03_TIMER";
 static const char *TAG4 = "PRATICA_04_PWM";
 static const char *TAG5 = "PRATICA_05_ADC";
 static const char *TAG6 = "PRATICA_06_LVGL";
-
-// --- Definições de Hardware ---
 #define LED_AZUL_GPIO 2
 #define PWM_LED_GPIO 26
 #define PWM_OSC_GPIO 33
-// ADC no GPIO 34 (Canal 3)
-
-// --- Configuração Display / LVGL ---
 #define I2C_BUS_PORT 0
-#define EXAMPLE_PIN_NUM_SDA 19  // SEUS PINOS (ESTÁVEIS)
-#define EXAMPLE_PIN_NUM_SCL 18  // SEUS PINOS (ESTÁVEIS)
+#define EXAMPLE_PIN_NUM_SDA 19  
+#define EXAMPLE_PIN_NUM_SCL 18  
 #define EXAMPLE_PIN_NUM_RST -1
-#define EXAMPLE_I2C_HW_ADDR 0x3C // Confirme endereço (0x3C ou 0x3D)
-
+#define EXAMPLE_I2C_HW_ADDR 0x3C 
 #define EXAMPLE_LCD_PIXEL_CLOCK_HZ (400 * 1000)
 #define EXAMPLE_LCD_H_RES 128
 #define EXAMPLE_LCD_V_RES 64
 #define EXAMPLE_LCD_CMD_BITS 8
 #define EXAMPLE_LCD_PARAM_BITS 8
-
 #define EXAMPLE_LVGL_TICK_PERIOD_MS 5
 #define EXAMPLE_LVGL_TASK_STACK_SIZE (4 * 1024)
 #define EXAMPLE_LVGL_TASK_PRIORITY 2
 #define EXAMPLE_LVGL_PALETTE_SIZE 8
 #define EXAMPLE_LVGL_TASK_MAX_DELAY_MS 500
 #define EXAMPLE_LVGL_TASK_MIN_DELAY_MS 1000 / CONFIG_FREERTOS_HZ
-
-// --- Estruturas e Variáveis Globais das Práticas Anteriores ---
 #define DEBOUNCE_DELAY_MS 150
+
 typedef struct {
     uint32_t gpio_num;
     TimerHandle_t timer_handle;
@@ -115,26 +98,15 @@ typedef struct {
 static QueueHandle_t adc_data_queue = NULL;
 static SemaphoreHandle_t adc_sync_semaphore = NULL;
 
-// --- Variáveis Globais Voláteis (Sincronização Simples) ---
-// O uso de 'volatile' garante que a leitura na UI pegue o valor mais recente
-// escrito pela task do Timer, sem precisar de mutex de dados.
 volatile real_time_clock_t g_rtc = {0, 0, 0};
 volatile adc_data_t g_adc_data = {0, 0};
 
 // Buffer do Display e Lock da API LVGL
 static uint8_t oled_buffer[EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES / 8];
-// Mantemos este lock APENAS para a estrutura do LVGL (exigido pelo exemplo), 
-// mas não vamos usá-lo na lógica de dados.
 static _lock_t lvgl_api_lock; 
 
-// Labels da Interface
 static lv_obj_t *label_time;
 static lv_obj_t *label_voltage;
-
-
-// ---------------------------------------------------------------------------
-// --- LÓGICA DAS TAREFAS ANTERIORES (Mantida Integralmente) ---
-// ---------------------------------------------------------------------------
 
 static void button_timer_callback(TimerHandle_t xTimer) {
     uint32_t gpio_num = (uint32_t) pvTimerGetTimerID(xTimer);
@@ -226,10 +198,6 @@ void gptimer_task(void *pvParameters) {
                     }
                 }
                 ESP_LOGI(TAG3, "Hora: %02d:%02d:%02d | ADC: %d mV", rtc.hour, rtc.minute, rtc.second, last_adc_data.voltage);
-                
-                // ATUALIZAÇÃO SEGURA (SEM MUTEX OS):
-                // Apenas escrevemos nas variáveis volatile.
-                // A interface gráfica (LVGL) vai ler isso no tempo dela.
                 g_rtc = rtc;
                 g_adc_data = last_adc_data;
             }
@@ -299,9 +267,7 @@ void adc_task(void *pvParameters) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// --- LVGL / DISPLAY (Correção de Deadlock) ---
-// ---------------------------------------------------------------------------
+//LVGL / DISPLAY (Correção de Deadlock)
 
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_panel, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
     lv_display_t *disp = (lv_display_t *)user_ctx;
@@ -334,7 +300,7 @@ static void lvgl_port_task(void *arg) {
     ESP_LOGI(TAG6, "Starting LVGL task");
     uint32_t time_till_next_ms = 0;
     while (1) {
-        // [LOCK AQUI] Protege o handler do LVGL
+        //Protege o handler do LVGL
         _lock_acquire(&lvgl_api_lock);
         time_till_next_ms = lv_timer_handler(); // Executa o LVGL (e nosso callback)
         _lock_release(&lvgl_api_lock);
@@ -345,16 +311,11 @@ static void lvgl_port_task(void *arg) {
     }
 }
 
-// !!! CORREÇÃO AQUI !!!
 static void update_ui_callback(lv_timer_t *timer) {
-    // 1. Lemos os valores voláteis (mais recentes)
-    // Sem mutex, apenas leitura rápida.
+
     real_time_clock_t current_rtc = g_rtc;
     adc_data_t current_adc = g_adc_data;
 
-    // 2. Atualizamos o texto.
-    // NÃO COLOCAMOS _lock_acquire AQUI, POIS JÁ ESTAMOS DENTRO DO LOCK DA TAREFA LVGL.
-    // (Isso evita o travamento que você viu na tela)
     lv_label_set_text_fmt(label_time, "Hora: %02d:%02d:%02d", current_rtc.hour, current_rtc.minute, current_rtc.second);
     lv_label_set_text_fmt(label_voltage, "ADC: %d mV", current_adc.voltage);
 }
@@ -399,7 +360,7 @@ void app_main(void) {
     adc_data_queue = xQueueCreate(5, sizeof(adc_data_t));
     xTaskCreate(adc_task, "adc_task", 4096, NULL, 5, NULL);
 
-    // --- CONFIGURAÇÃO DISPLAY I2C / LVGL ---
+    //CONFIGURAÇÃO DISPLAY I2C / LVGL
     ESP_LOGI(TAG6, "Configurando Display...");
     i2c_master_bus_handle_t i2c_bus = NULL;
     i2c_master_bus_config_t bus_config = {
