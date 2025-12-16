@@ -1,26 +1,30 @@
 /**
  * Nomes: Brenon Lenes Bettcher, Patrick Gonçalves
- * Projeto: Prática 06 - Multitarefa com Display LVGL (Sincronização Corrigida)
- * Descrição: Integração das práticas anteriores com exibição de Hora e Tensão.
- * Solução: Uso de variáveis volatile e correção do Deadlock no callback da UI.
+ * Projeto: Prática 07 - Integração MQTT no Sistema Estável
+ * Descrição: Código base da Prática 07 (Estável) + Controle MQTT/Wi-Fi.
  */
 
 #include <stdio.h>
 #include <inttypes.h>
-#include <unistd.h>      
-#include <sys/lock.h>    
-#include <sys/param.h>   
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/lock.h>
+#include <sys/param.h>
+
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
+
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_system.h"
 #include "esp_log.h"
-#include "esp_timer.h"   
+#include "esp_timer.h"
+
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "driver/ledc.h"
@@ -28,24 +32,35 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "lvgl.h"
+
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "protocol_examples_common.h"
+#include "mqtt_client.h"
+
 static const char *TAG1 = "PRATICA_01_LOG";
 static const char *TAG2 = "PRATICA_02_BUTTON";
 static const char *TAG3 = "PRATICA_03_TIMER";
 static const char *TAG4 = "PRATICA_04_PWM";
 static const char *TAG5 = "PRATICA_05_ADC";
 static const char *TAG6 = "PRATICA_06_LVGL";
+static const char *TAG7 = "PRATICA_07_MQTT";
+
 #define LED_AZUL_GPIO 2
 #define PWM_LED_GPIO 26
 #define PWM_OSC_GPIO 33
 #define I2C_BUS_PORT 0
-#define EXAMPLE_PIN_NUM_SDA 19  
-#define EXAMPLE_PIN_NUM_SCL 18  
+#define EXAMPLE_PIN_NUM_SDA 19
+#define EXAMPLE_PIN_NUM_SCL 18
 #define EXAMPLE_PIN_NUM_RST -1
-#define EXAMPLE_I2C_HW_ADDR 0x3C 
+#define EXAMPLE_I2C_HW_ADDR 0x3C
 #define EXAMPLE_LCD_PIXEL_CLOCK_HZ (400 * 1000)
 #define EXAMPLE_LCD_H_RES 128
 #define EXAMPLE_LCD_V_RES 64
@@ -58,6 +73,9 @@ static const char *TAG6 = "PRATICA_06_LVGL";
 #define EXAMPLE_LVGL_TASK_MAX_DELAY_MS 500
 #define EXAMPLE_LVGL_TASK_MIN_DELAY_MS 1000 / CONFIG_FREERTOS_HZ
 #define DEBOUNCE_DELAY_MS 150
+#define MQTT_BROKER_URI "mqtt://g2device:g2device@node02.myqtthub.com:1883"
+#define MQTT_TOPIC_SUB  "g2device/pwm"
+#define MQTT_TOPIC_PUB  "g2device/leitura"
 
 typedef struct {
     uint32_t gpio_num;
@@ -87,24 +105,26 @@ static QueueHandle_t gptimer_queue = NULL;
 typedef struct {
     bool set_auto_mode;
     int16_t increment;
-} PWM_elements_t;
+    int32_t mqtt_duty; //Valor absoluto
+    bool is_mqtt;      //Flag de origem
+} 
+
+PWM_elements_t;
 static QueueHandle_t pwm_control_queue = NULL;
 static SemaphoreHandle_t pwm_sync_semaphore = NULL;
-
 typedef struct {
     int raw;
     int voltage;
-} adc_data_t;
+} 
+
+adc_data_t;
 static QueueHandle_t adc_data_queue = NULL;
 static SemaphoreHandle_t adc_sync_semaphore = NULL;
-
 volatile real_time_clock_t g_rtc = {0, 0, 0};
 volatile adc_data_t g_adc_data = {0, 0};
-
-// Buffer do Display e Lock da API LVGL
+esp_mqtt_client_handle_t mqtt_client = NULL;
 static uint8_t oled_buffer[EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES / 8];
-static _lock_t lvgl_api_lock; 
-
+static _lock_t lvgl_api_lock;
 static lv_obj_t *label_time;
 static lv_obj_t *label_voltage;
 
@@ -131,11 +151,59 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
     }
 }
 
+static bool IRAM_ATTR timer_alarm_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
+    BaseType_t high_task_awoken = pdFALSE;
+    timer_event_t event_data = { .event_count = edata->count_value, .alarm_value = edata->alarm_value };
+    xQueueSendFromISR(gptimer_queue, &event_data, &high_task_awoken);
+    gptimer_alarm_config_t next_alarm_config = { .alarm_count = edata->alarm_value + 100000, .reload_count = 0, .flags.auto_reload_on_alarm = false };
+    gptimer_set_alarm_action(timer, &next_alarm_config);
+    return high_task_awoken == pdTRUE;
+}
+
+//Implementação MQTT (Prática 07)
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG7, "MQTT Conectado! Inscrevendo em %s", MQTT_TOPIC_SUB);
+        esp_mqtt_client_subscribe(mqtt_client, MQTT_TOPIC_SUB, 0);
+        break;
+    case MQTT_EVENT_DATA:
+        if (strncmp(event->topic, MQTT_TOPIC_SUB, event->topic_len) == 0) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
+            int duty = atoi(buf);
+            
+            ESP_LOGI(TAG7, "Comando MQTT recebido: %d", duty);
+            
+            PWM_elements_t cmd;
+            cmd.set_auto_mode = false;
+            cmd.is_mqtt = true; 
+            cmd.mqtt_duty = duty;
+            xQueueSend(pwm_control_queue, &cmd, 0);
+        }
+        break;
+    default: break;
+    }
+}
+
+static void mqtt_app_start(void) {
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        .credentials.client_id = "g2device",
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
 static void button_task(void* arg) {
     uint32_t io_num;
     while (true) {
         if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
             PWM_elements_t pwm_cmd;
+            pwm_cmd.is_mqtt = false;
             bool command_valid = true;
             switch (io_num) {
                 case 21: pwm_cmd.set_auto_mode = true; pwm_cmd.increment = 0; break;
@@ -150,21 +218,12 @@ static void button_task(void* arg) {
     }
 }
 
-static bool IRAM_ATTR timer_alarm_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-    BaseType_t high_task_awoken = pdFALSE;
-    timer_event_t event_data = { .event_count = edata->count_value, .alarm_value = edata->alarm_value };
-    xQueueSendFromISR(gptimer_queue, &event_data, &high_task_awoken);
-    gptimer_alarm_config_t next_alarm_config = { .alarm_count = edata->alarm_value + 100000, .reload_count = 0, .flags.auto_reload_on_alarm = false };
-    gptimer_set_alarm_action(timer, &next_alarm_config);
-    return high_task_awoken == pdTRUE;
-}
-
-// Tarefa do Timer: Atualiza o Relógio e as Variáveis Globais
 void gptimer_task(void *pvParameters) {
     ESP_LOGI(TAG3, "Iniciando GPTimer.");
     real_time_clock_t rtc = {0, 0, 0};
     int interrupt_counter = 0;
     adc_data_t last_adc_data = {0, 0};
+    timer_event_t evt;
 
     gptimer_handle_t gptimer = NULL;
     gptimer_config_t timer_config = { .clk_src = GPTIMER_CLK_SRC_DEFAULT, .direction = GPTIMER_COUNT_UP, .resolution_hz = 1000000 };
@@ -175,7 +234,6 @@ void gptimer_task(void *pvParameters) {
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
     ESP_ERROR_CHECK(gptimer_enable(gptimer));
     ESP_ERROR_CHECK(gptimer_start(gptimer));
-    timer_event_t evt;
 
     while (1) {
         if (xQueueReceive(gptimer_queue, &evt, portMAX_DELAY)) {
@@ -183,11 +241,10 @@ void gptimer_task(void *pvParameters) {
             xSemaphoreGive(adc_sync_semaphore);
 
             if (xQueueReceive(adc_data_queue, &last_adc_data, 0) == pdPASS) {
-                // Nova leitura ADC recebida
             }
 
             interrupt_counter++;
-            if (interrupt_counter >= 10) {
+            if (interrupt_counter >= 10) { // 1 segundo
                 interrupt_counter = 0;
                 rtc.second++;
                 if (rtc.second >= 60) {
@@ -198,8 +255,20 @@ void gptimer_task(void *pvParameters) {
                     }
                 }
                 ESP_LOGI(TAG3, "Hora: %02d:%02d:%02d | ADC: %d mV", rtc.hour, rtc.minute, rtc.second, last_adc_data.voltage);
+                
+                //Atualiza globais (Display)
                 g_rtc = rtc;
                 g_adc_data = last_adc_data;
+
+                //Publica no MQTT a cada 5s
+                static int pub_count = 0;
+                if (++pub_count >= 5 && mqtt_client) {
+                    pub_count = 0;
+                    char msg[16];
+                    sprintf(msg, "%d", last_adc_data.voltage);
+                    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_PUB, msg, 0, 0, 0);
+                    ESP_LOGI(TAG7, "Dados ADC publicados: %s", msg);
+                }
             }
         }
     }
@@ -209,10 +278,10 @@ void pwm_task(void *pvParameters) {
     ESP_LOGI(TAG4, "Iniciando PWM.");
     ledc_timer_config_t ledc_timer = { .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0, .duty_resolution = LEDC_TIMER_13_BIT, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK };
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-    ledc_channel_config_t ledc_channel_0 = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_LED_GPIO, .duty = 0, .hpoint = 0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_0));
-    ledc_channel_config_t ledc_channel_1 = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_OSC_GPIO, .duty = 0, .hpoint = 0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_1));
+    ledc_channel_config_t c0 = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_LED_GPIO, .duty = 0, .hpoint = 0 };
+    ESP_ERROR_CHECK(ledc_channel_config(&c0));
+    ledc_channel_config_t c1 = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_OSC_GPIO, .duty = 0, .hpoint = 0 };
+    ESP_ERROR_CHECK(ledc_channel_config(&c1));
 
     bool is_auto_mode = true;
     uint32_t duty_cycle = 0;
@@ -221,12 +290,19 @@ void pwm_task(void *pvParameters) {
 
     while (1) {
         if (xQueueReceive(pwm_control_queue, &pwm_cmd, 0) == pdPASS) {
-            if(pwm_cmd.increment == 0) is_auto_mode = pwm_cmd.set_auto_mode;
-            else is_auto_mode = false;
-            
-            if (!is_auto_mode && pwm_cmd.increment != 0) {
-                if (pwm_cmd.increment > 0) { duty_cycle += 410; if (duty_cycle > 8191) duty_cycle = 8191; }
-                else if (pwm_cmd.increment < 0) { if (duty_cycle < 410) duty_cycle = 0; else duty_cycle -= 410; }
+            if (pwm_cmd.is_mqtt) {
+                is_auto_mode = false;
+                duty_cycle = pwm_cmd.mqtt_duty;
+                if (duty_cycle > 8191) duty_cycle = 8191;
+                if (duty_cycle < 0) duty_cycle = 0;
+                ESP_LOGI(TAG4, "Modo MQTT Ativado | Duty: %ld", duty_cycle);
+            } else {
+                if(pwm_cmd.increment == 0) is_auto_mode = pwm_cmd.set_auto_mode;
+                else is_auto_mode = false;
+                if (!is_auto_mode && pwm_cmd.increment != 0) {
+                    if (pwm_cmd.increment > 0) { duty_cycle += 410; if (duty_cycle > 8191) duty_cycle = 8191; }
+                    else if (pwm_cmd.increment < 0) { if (duty_cycle < 410) duty_cycle = 0; else duty_cycle -= 410; }
+                }
             }
         }
 
@@ -267,8 +343,6 @@ void adc_task(void *pvParameters) {
     }
 }
 
-//LVGL / DISPLAY (Correção de Deadlock)
-
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_panel, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
     lv_display_t *disp = (lv_display_t *)user_ctx;
     lv_display_flush_ready(disp);
@@ -300,9 +374,8 @@ static void lvgl_port_task(void *arg) {
     ESP_LOGI(TAG6, "Starting LVGL task");
     uint32_t time_till_next_ms = 0;
     while (1) {
-        //Protege o handler do LVGL
         _lock_acquire(&lvgl_api_lock);
-        time_till_next_ms = lv_timer_handler(); // Executa o LVGL (e nosso callback)
+        time_till_next_ms = lv_timer_handler();
         _lock_release(&lvgl_api_lock);
         
         time_till_next_ms = MAX(time_till_next_ms, EXAMPLE_LVGL_TASK_MIN_DELAY_MS);
@@ -312,10 +385,8 @@ static void lvgl_port_task(void *arg) {
 }
 
 static void update_ui_callback(lv_timer_t *timer) {
-
     real_time_clock_t current_rtc = g_rtc;
     adc_data_t current_adc = g_adc_data;
-
     lv_label_set_text_fmt(label_time, "Hora: %02d:%02d:%02d", current_rtc.hour, current_rtc.minute, current_rtc.second);
     lv_label_set_text_fmt(label_voltage, "ADC: %d mV", current_adc.voltage);
 }
@@ -332,9 +403,13 @@ static void create_demo_ui(lv_display_t *disp) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG1, "Iniciando Pratica 06 (Integrada)...");
-    
-    // Configura hardware
+    ESP_LOGI(TAG1, "Iniciando Pratica 07...");
+    //Inicialização de Wi-Fi e Flash
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(example_connect());
+
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
     gpio_install_isr_service(0);
@@ -346,11 +421,10 @@ void app_main(void) {
     }
     gpio_config_t io_conf = { .intr_type = GPIO_INTR_NEGEDGE, .pin_bit_mask = pin_bit_mask, .mode = GPIO_MODE_INPUT, .pull_up_en = 1 };
     gpio_config(&io_conf);
-    
     gpio_reset_pin(LED_AZUL_GPIO); gpio_set_direction(LED_AZUL_GPIO, GPIO_MODE_OUTPUT);
 
     gptimer_queue = xQueueCreate(5, sizeof(timer_event_t));
-    xTaskCreate(gptimer_task, "gptimer_task", 2048, NULL, 5, NULL);
+    xTaskCreate(gptimer_task, "gptimer_task", 4096, NULL, 5, NULL);
 
     pwm_sync_semaphore = xSemaphoreCreateBinary();
     pwm_control_queue = xQueueCreate(5, sizeof(PWM_elements_t));
@@ -360,7 +434,10 @@ void app_main(void) {
     adc_data_queue = xQueueCreate(5, sizeof(adc_data_t));
     xTaskCreate(adc_task, "adc_task", 4096, NULL, 5, NULL);
 
-    //CONFIGURAÇÃO DISPLAY I2C / LVGL
+    //Inicia Cliente MQTT
+    mqtt_app_start();
+
+    // Configuração Display I2C / LVGL
     ESP_LOGI(TAG6, "Configurando Display...");
     i2c_master_bus_handle_t i2c_bus = NULL;
     i2c_master_bus_config_t bus_config = {
@@ -420,5 +497,5 @@ void app_main(void) {
     lv_timer_create(update_ui_callback, 500, NULL);
     _lock_release(&lvgl_api_lock);
     
-    ESP_LOGI(TAG6, "Sistema Rodando.");
+    ESP_LOGI(TAG6, "Sistema Rodando (MQTT + Display + PWM + ADC).");
 }
