@@ -10,4 +10,5 @@ idf_component_register(SRCS "main.c"
                       esp_lcd 
                       lvgl 
                       mqtt
-                      spi_flash)
+                      spi_flash
+                       lwip)

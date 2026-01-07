@@ -1,190 +1,153 @@
 /**
- * Nomes: Brenon Lenes Bettcher, Patrick Gonçalves
- * Projeto: Prática 07 - Integração MQTT no Sistema Estável
- * Descrição: Código base da Prática 07 (Estável) + Controle MQTT/Wi-Fi.
+ * Projeto Final: Smart Greenhouse (Estufa de Orquídeas)
+ * Autores: Brenon Lenes Bettcher, Patrick Gonçalves
+ * * Funcionalidades:
+ * - Leitura de Temperatura via ADC (Simulado por Potenciômetro).
+ * - Controle PID Simples (PWM) para Aquecimento/Luminosidade.
+ * - Troca de Espectro de Luz (Amarelo/Azul) via MQTT.
+ * - Setpoint de Temperatura e Umidade via MQTT.
+ * - Relógio em Tempo Real via Internet (SNTP).
+ * - Display OLED com Interface LVGL.
  */
 
 #include <stdio.h>
-#include <inttypes.h>
-#include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/lock.h>
-#include <sys/param.h>
-
-#include "sdkconfig.h"
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/timers.h"
 #include "freertos/semphr.h"
-
-#include "esp_chip_info.h"
-#include "esp_flash.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "protocol_examples_common.h"
+#include "mqtt_client.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 
+// Hardware Drivers
 #include "driver/gpio.h"
-#include "driver/gptimer.h"
 #include "driver/ledc.h"
 #include "driver/i2c_master.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
+// Display & LVGL
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "lvgl.h"
 
-#include "nvs_flash.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
-#include "protocol_examples_common.h"
-#include "mqtt_client.h"
+// --- Configurações e Defines ---
+#define TAG "GREENHOUSE"
 
-static const char *TAG1 = "PRATICA_01_LOG";
-static const char *TAG2 = "PRATICA_02_BUTTON";
-static const char *TAG3 = "PRATICA_03_TIMER";
-static const char *TAG4 = "PRATICA_04_PWM";
-static const char *TAG5 = "PRATICA_05_ADC";
-static const char *TAG6 = "PRATICA_06_LVGL";
-static const char *TAG7 = "PRATICA_07_MQTT";
-
-#define LED_AZUL_GPIO 2
-#define PWM_LED_GPIO 26
-#define PWM_OSC_GPIO 33
-#define I2C_BUS_PORT 0
-#define EXAMPLE_PIN_NUM_SDA 19
-#define EXAMPLE_PIN_NUM_SCL 18
-#define EXAMPLE_PIN_NUM_RST -1
-#define EXAMPLE_I2C_HW_ADDR 0x3C
-#define EXAMPLE_LCD_PIXEL_CLOCK_HZ (400 * 1000)
-#define EXAMPLE_LCD_H_RES 128
-#define EXAMPLE_LCD_V_RES 64
-#define EXAMPLE_LCD_CMD_BITS 8
-#define EXAMPLE_LCD_PARAM_BITS 8
-#define EXAMPLE_LVGL_TICK_PERIOD_MS 5
-#define EXAMPLE_LVGL_TASK_STACK_SIZE (4 * 1024)
-#define EXAMPLE_LVGL_TASK_PRIORITY 2
-#define EXAMPLE_LVGL_PALETTE_SIZE 8
-#define EXAMPLE_LVGL_TASK_MAX_DELAY_MS 500
-#define EXAMPLE_LVGL_TASK_MIN_DELAY_MS 1000 / CONFIG_FREERTOS_HZ
-#define DEBOUNCE_DELAY_MS 150
+// MQTT
 #define MQTT_BROKER_URI "mqtt://g2device:g2device@node02.myqtthub.com:1883"
-#define MQTT_TOPIC_SUB  "g2device/pwm"
-#define MQTT_TOPIC_PUB  "g2device/leitura"
+#define MQTT_TOPIC_CONFIG "g2device/config"   // Enviar "T:25 H:60"
+#define MQTT_TOPIC_COLOR  "g2device/color"    // Enviar "YELLOW" ou "BLUE"
+#define MQTT_TOPIC_DATA   "g2device/monitor"  // Publica dados
+
+// Pinos
+#define PWM_PIN_YELLOW    26 // Luz Solar / Aquecimento
+#define PWM_PIN_BLUE      33 // Luz UV
+#define I2C_SDA           19
+#define I2C_SCL           18
+
+// Display
+#define LCD_H_RES         128
+#define LCD_V_RES         64
+
+// Estrutura Global do Estado da Estufa
+typedef enum {
+    LIGHT_YELLOW = 0, // Simula Sol
+    LIGHT_BLUE = 1    // Simula UV
+} light_color_t;
 
 typedef struct {
-    uint32_t gpio_num;
-    TimerHandle_t timer_handle;
-} button_config_t;
+    int target_temp;    // Temperatura Desejada (recebida MQTT)
+    int target_hum;     // Umidade Desejada (recebida MQTT)
+    int current_temp;   // Temperatura Lida (ADC)
+    int current_hum;    // Umidade Lida (Simulada para este exemplo)
+    light_color_t color_mode;
+    int pwm_intensity;  // 0 a 8191
+} greenhouse_state_t;
 
-static button_config_t buttons[] = {
-    { .gpio_num = 21, .timer_handle = NULL },
-    { .gpio_num = 22, .timer_handle = NULL },
-    { .gpio_num = 23, .timer_handle = NULL }
+// Variáveis Globais Protegidas
+static greenhouse_state_t g_state = {
+    .target_temp = 25, // Default Orquídea
+    .target_hum = 60,
+    .current_temp = 0,
+    .current_hum = 55,
+    .color_mode = LIGHT_YELLOW,
+    .pwm_intensity = 0
 };
-#define NUM_BUTTONS (sizeof(buttons) / sizeof(button_config_t))
-static QueueHandle_t gpio_evt_queue = NULL;
 
-typedef struct {
-    uint64_t event_count;
-    uint64_t alarm_value;
-} timer_event_t;
-
-typedef struct {
-    uint8_t hour;
-    uint8_t minute;
-    uint8_t second;
-} real_time_clock_t;
-static QueueHandle_t gptimer_queue = NULL;
-
-typedef struct {
-    bool set_auto_mode;
-    int16_t increment;
-    int32_t mqtt_duty; //Valor absoluto
-    bool is_mqtt;      //Flag de origem
-} 
-
-PWM_elements_t;
-static QueueHandle_t pwm_control_queue = NULL;
-static SemaphoreHandle_t pwm_sync_semaphore = NULL;
-typedef struct {
-    int raw;
-    int voltage;
-} 
-
-adc_data_t;
-static QueueHandle_t adc_data_queue = NULL;
-static SemaphoreHandle_t adc_sync_semaphore = NULL;
-volatile real_time_clock_t g_rtc = {0, 0, 0};
-volatile adc_data_t g_adc_data = {0, 0};
+static SemaphoreHandle_t xStateMutex = NULL;
 esp_mqtt_client_handle_t mqtt_client = NULL;
-static uint8_t oled_buffer[EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES / 8];
+
+// Variáveis LVGL
 static _lock_t lvgl_api_lock;
-static lv_obj_t *label_time;
-static lv_obj_t *label_voltage;
+static lv_obj_t *lbl_clock;
+static lv_obj_t *lbl_temp;
+static lv_obj_t *lbl_target;
+static lv_obj_t *lbl_mode;
 
-static void button_timer_callback(TimerHandle_t xTimer) {
-    uint32_t gpio_num = (uint32_t) pvTimerGetTimerID(xTimer);
-    if (gpio_get_level(gpio_num) == 0) {
-        xQueueSend(gpio_evt_queue, &gpio_num, portMAX_DELAY);
-    }
+// --- Implementação SNTP (Tempo Real) ---
+void initialize_sntp(void) {
+    ESP_LOGI(TAG, "Inicializando SNTP...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    
+    // Configura Fuso Horário (Brasília)
+    setenv("TZ", "BRT3", 1);
+    tzset();
 }
 
-static void IRAM_ATTR gpio_isr_handler(void* arg) {
-    uint32_t gpio_num = (uint32_t) arg;
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    for (int i = 0; i < NUM_BUTTONS; i++) {
-        if (buttons[i].gpio_num == gpio_num) {
-            if (buttons[i].timer_handle != NULL) {
-                xTimerResetFromISR(buttons[i].timer_handle, &xHigherPriorityTaskWoken);
-            }
-            break;
-        }
-    }
-    if (xHigherPriorityTaskWoken) {
-        portYIELD_FROM_ISR();
-    }
+void get_time_str(char *buffer, size_t size) {
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    strftime(buffer, size, "%H:%M:%S", &timeinfo);
 }
 
-static bool IRAM_ATTR timer_alarm_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-    BaseType_t high_task_awoken = pdFALSE;
-    timer_event_t event_data = { .event_count = edata->count_value, .alarm_value = edata->alarm_value };
-    xQueueSendFromISR(gptimer_queue, &event_data, &high_task_awoken);
-    gptimer_alarm_config_t next_alarm_config = { .alarm_count = edata->alarm_value + 100000, .reload_count = 0, .flags.auto_reload_on_alarm = false };
-    gptimer_set_alarm_action(timer, &next_alarm_config);
-    return high_task_awoken == pdTRUE;
-}
-
-//Implementação MQTT (Prática 07)
-
+// --- Callbacks MQTT ---
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = event_data;
-    switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG7, "MQTT Conectado! Inscrevendo em %s", MQTT_TOPIC_SUB);
-        esp_mqtt_client_subscribe(mqtt_client, MQTT_TOPIC_SUB, 0);
-        break;
-    case MQTT_EVENT_DATA:
-        if (strncmp(event->topic, MQTT_TOPIC_SUB, event->topic_len) == 0) {
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%.*s", event->data_len, event->data);
-            int duty = atoi(buf);
-            
-            ESP_LOGI(TAG7, "Comando MQTT recebido: %d", duty);
-            
-            PWM_elements_t cmd;
-            cmd.set_auto_mode = false;
-            cmd.is_mqtt = true; 
-            cmd.mqtt_duty = duty;
-            xQueueSend(pwm_control_queue, &cmd, 0);
+    if (event_id == MQTT_EVENT_CONNECTED) {
+        ESP_LOGI(TAG, "MQTT Conectado.");
+        esp_mqtt_client_subscribe(mqtt_client, MQTT_TOPIC_CONFIG, 0);
+        esp_mqtt_client_subscribe(mqtt_client, MQTT_TOPIC_COLOR, 0);
+    } 
+    else if (event_id == MQTT_EVENT_DATA) {
+        char payload[32];
+        snprintf(payload, event->data_len + 1, "%.*s", event->data_len, event->data);
+        
+        if (xSemaphoreTake(xStateMutex, portMAX_DELAY)) {
+            if (strncmp(event->topic, MQTT_TOPIC_COLOR, event->topic_len) == 0) {
+                // Comando de Cor
+                if (strstr(payload, "BLUE")) g_state.color_mode = LIGHT_BLUE;
+                else g_state.color_mode = LIGHT_YELLOW;
+                ESP_LOGI(TAG, "Mudança de Cor: %s", payload);
+            } 
+            else if (strncmp(event->topic, MQTT_TOPIC_CONFIG, event->topic_len) == 0) {
+                // Configuração "T:xx H:xx"
+                int t, h;
+                if (sscanf(payload, "T:%d H:%d", &t, &h) == 2) {
+                    g_state.target_temp = t;
+                    g_state.target_hum = h;
+                    ESP_LOGI(TAG, "Novos Alvos -> T: %d, H: %d", t, h);
+                }
+            }
+            xSemaphoreGive(xStateMutex);
         }
-        break;
-    default: break;
     }
 }
 
@@ -198,253 +161,181 @@ static void mqtt_app_start(void) {
     esp_mqtt_client_start(mqtt_client);
 }
 
-static void button_task(void* arg) {
-    uint32_t io_num;
-    while (true) {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            PWM_elements_t pwm_cmd;
-            pwm_cmd.is_mqtt = false;
-            bool command_valid = true;
-            switch (io_num) {
-                case 21: pwm_cmd.set_auto_mode = true; pwm_cmd.increment = 0; break;
-                case 22: pwm_cmd.set_auto_mode = false; pwm_cmd.increment = -1; break;
-                case 23: pwm_cmd.set_auto_mode = false; pwm_cmd.increment = 1; break;
-                default: command_valid = false; break;
-            }
-            if (command_valid) {
-                xQueueSend(pwm_control_queue, &pwm_cmd, portMAX_DELAY);
-            }
-        }
-    }
-}
-
-void gptimer_task(void *pvParameters) {
-    ESP_LOGI(TAG3, "Iniciando GPTimer.");
-    real_time_clock_t rtc = {0, 0, 0};
-    int interrupt_counter = 0;
-    adc_data_t last_adc_data = {0, 0};
-    timer_event_t evt;
-
-    gptimer_handle_t gptimer = NULL;
-    gptimer_config_t timer_config = { .clk_src = GPTIMER_CLK_SRC_DEFAULT, .direction = GPTIMER_COUNT_UP, .resolution_hz = 1000000 };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
-    gptimer_alarm_config_t alarm_config = { .alarm_count = 100000, .reload_count = 0, .flags.auto_reload_on_alarm = false };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
-    gptimer_event_callbacks_t cbs = { .on_alarm = timer_alarm_isr_callback };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(gptimer));
-    ESP_ERROR_CHECK(gptimer_start(gptimer));
-
-    while (1) {
-        if (xQueueReceive(gptimer_queue, &evt, portMAX_DELAY)) {
-            xSemaphoreGive(pwm_sync_semaphore);
-            xSemaphoreGive(adc_sync_semaphore);
-
-            if (xQueueReceive(adc_data_queue, &last_adc_data, 0) == pdPASS) {
-            }
-
-            interrupt_counter++;
-            if (interrupt_counter >= 10) { // 1 segundo
-                interrupt_counter = 0;
-                rtc.second++;
-                if (rtc.second >= 60) {
-                    rtc.second = 0; rtc.minute++;
-                    if (rtc.minute >= 60) {
-                        rtc.minute = 0; rtc.hour++;
-                        if (rtc.hour >= 24) rtc.hour = 0;
-                    }
-                }
-                ESP_LOGI(TAG3, "Hora: %02d:%02d:%02d | ADC: %d mV", rtc.hour, rtc.minute, rtc.second, last_adc_data.voltage);
-                
-                //Atualiza globais (Display)
-                g_rtc = rtc;
-                g_adc_data = last_adc_data;
-
-                //Publica no MQTT a cada 5s
-                static int pub_count = 0;
-                if (++pub_count >= 5 && mqtt_client) {
-                    pub_count = 0;
-                    char msg[16];
-                    sprintf(msg, "%d", last_adc_data.voltage);
-                    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_PUB, msg, 0, 0, 0);
-                    ESP_LOGI(TAG7, "Dados ADC publicados: %s", msg);
-                }
-            }
-        }
-    }
-}
-
-void pwm_task(void *pvParameters) {
-    ESP_LOGI(TAG4, "Iniciando PWM.");
-    ledc_timer_config_t ledc_timer = { .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0, .duty_resolution = LEDC_TIMER_13_BIT, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-    ledc_channel_config_t c0 = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_LED_GPIO, .duty = 0, .hpoint = 0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&c0));
-    ledc_channel_config_t c1 = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_OSC_GPIO, .duty = 0, .hpoint = 0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&c1));
-
-    bool is_auto_mode = true;
-    uint32_t duty_cycle = 0;
-    int sawtooth_step = 82;
-    PWM_elements_t pwm_cmd;
-
-    while (1) {
-        if (xQueueReceive(pwm_control_queue, &pwm_cmd, 0) == pdPASS) {
-            if (pwm_cmd.is_mqtt) {
-                is_auto_mode = false;
-                duty_cycle = pwm_cmd.mqtt_duty;
-                if (duty_cycle > 8191) duty_cycle = 8191;
-                if (duty_cycle < 0) duty_cycle = 0;
-                ESP_LOGI(TAG4, "Modo MQTT Ativado | Duty: %ld", duty_cycle);
-            } else {
-                if(pwm_cmd.increment == 0) is_auto_mode = pwm_cmd.set_auto_mode;
-                else is_auto_mode = false;
-                if (!is_auto_mode && pwm_cmd.increment != 0) {
-                    if (pwm_cmd.increment > 0) { duty_cycle += 410; if (duty_cycle > 8191) duty_cycle = 8191; }
-                    else if (pwm_cmd.increment < 0) { if (duty_cycle < 410) duty_cycle = 0; else duty_cycle -= 410; }
-                }
-            }
-        }
-
-        if (is_auto_mode) {
-            if (xSemaphoreTake(pwm_sync_semaphore, pdMS_TO_TICKS(10)) == pdTRUE) {
-                duty_cycle += sawtooth_step;
-                if (duty_cycle > 8191) duty_cycle = 0;
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_cycle); ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty_cycle); ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-    }
-}
-
+// --- Tarefa ADC (Leitura Sensores) ---
 void adc_task(void *pvParameters) {
-    ESP_LOGI(TAG5, "Iniciando ADC.");
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    
+    // Canal 3 = Temperatura (Potenciômetro)
     adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_DEFAULT, .atten = ADC_ATTEN_DB_11 };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_3, &config));
+
+    // Calibração
     adc_cali_handle_t cali_handle = NULL;
     adc_cali_line_fitting_config_t cali_config = { .unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_11, .bitwidth = ADC_BITWIDTH_DEFAULT };
     ESP_ERROR_CHECK(adc_cali_create_scheme_line_fitting(&cali_config, &cali_handle));
 
-    adc_data_t data_to_send;
     while (1) {
-        if (xSemaphoreTake(adc_sync_semaphore, portMAX_DELAY) == pdTRUE) {
-            int raw_value, voltage_value;
-            ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_3, &raw_value));
-            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle, raw_value, &voltage_value));
-            data_to_send.raw = raw_value;
-            data_to_send.voltage = voltage_value;
-            xQueueSend(adc_data_queue, &data_to_send, 0);
+        int voltage;
+        int raw;
+        // Leitura da Temperatura (Mapeada de 0-3000mV para 0-50 Graus C para teste)
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_3, &raw));
+        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle, raw, &voltage));
+        
+        int temp_celsius = voltage / 60; // Conversão rudimentar p/ teste (0 a ~50C)
+
+        if (xSemaphoreTake(xStateMutex, portMAX_DELAY)) {
+            g_state.current_temp = temp_celsius;
+            
+            // Simulação de variação de umidade baseada na temperatura (física básica)
+            // Se esquenta muito, umidade cai um pouco
+            g_state.current_hum = 80 - (temp_celsius / 2); 
+            xSemaphoreGive(xStateMutex);
         }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_panel, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
-    lv_display_t *disp = (lv_display_t *)user_ctx;
-    lv_display_flush_ready(disp);
-    return false;
+// --- Tarefa de Controle (PWM + Lógica Estufa) ---
+void control_task(void *pvParameters) {
+    // Configura PWM
+    ledc_timer_config_t ledc_timer = { .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0, .duty_resolution = LEDC_TIMER_13_BIT, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK };
+    ledc_timer_config(&ledc_timer);
+
+    ledc_channel_config_t c_yellow = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_PIN_YELLOW, .duty = 0, .hpoint = 0 };
+    ledc_channel_config(&c_yellow);
+
+    ledc_channel_config_t c_blue = { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = PWM_PIN_BLUE, .duty = 0, .hpoint = 0 };
+    ledc_channel_config(&c_blue);
+
+    while (1) {
+        if (xSemaphoreTake(xStateMutex, portMAX_DELAY)) {
+            int error = g_state.target_temp - g_state.current_temp;
+            int new_duty = 0;
+
+            // Lógica Proporcional: Se Temp < Alvo, Liga Aquecedor (Luz)
+            // "Quanto maior o brilho, maior a temperatura"
+            if (error > 0) {
+                // Precisa aquecer. Erro grande = Duty Grande.
+                new_duty = error * 1000; 
+                if (new_duty > 8191) new_duty = 8191;
+                if (new_duty < 500) new_duty = 500; // Mínimo para ver aceso
+            } else {
+                // Já está quente, desliga ou mantém mínimo
+                new_duty = 0;
+            }
+            g_state.pwm_intensity = new_duty;
+            
+            // Aplica ao canal correto
+            if (g_state.color_mode == LIGHT_YELLOW) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, new_duty);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0); // Desliga Azul
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+            } else {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, new_duty);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0); // Desliga Amarelo
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            }
+            
+            xSemaphoreGive(xStateMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100)); // Atualização rápida do controle (10Hz)
+    }
 }
 
+// --- Interface Gráfica LVGL ---
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     esp_lcd_panel_handle_t panel_handle = lv_display_get_user_data(disp);
-    px_map += EXAMPLE_LVGL_PALETTE_SIZE;
-    uint16_t hor_res = lv_display_get_physical_horizontal_resolution(disp);
     int x1 = area->x1, x2 = area->x2, y1 = area->y1, y2 = area->y2;
-
-    for (int y = y1; y <= y2; y++) {
-        for (int x = x1; x <= x2; x++) {
-            bool chroma_color = (px_map[(hor_res >> 3) * y + (x >> 3)] & 1 << (7 - x % 8));
-            uint8_t *buf = oled_buffer + hor_res * (y >> 3) + (x);
-            if (chroma_color) (*buf) &= ~(1 << (y % 8));
-            else (*buf) |= (1 << (y % 8));
-        }
-    }
-    esp_lcd_panel_draw_bitmap(panel_handle, x1, y1, x2 + 1, y2 + 1, oled_buffer);
+    esp_lcd_panel_draw_bitmap(panel_handle, x1, y1, x2 + 1, y2 + 1, px_map);
+    lv_display_flush_ready(disp);
 }
 
-static void increase_lvgl_tick(void *arg) {
-    lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
+static void increase_lvgl_tick(void *arg) { lv_tick_inc(5); }
+
+static void update_ui_callback(lv_timer_t *timer) {
+    if (xSemaphoreTake(xStateMutex, 100)) {
+        char time_buf[16];
+        get_time_str(time_buf, sizeof(time_buf));
+        
+        lv_label_set_text_fmt(lbl_clock, "Hora: %s", time_buf);
+        lv_label_set_text_fmt(lbl_temp, "Ambiente: %d C | %d%%", g_state.current_temp, g_state.current_hum);
+        lv_label_set_text_fmt(lbl_target, "Meta: %d C (Duty:%d)", g_state.target_temp, g_state.pwm_intensity/82);
+        
+        if(g_state.color_mode == LIGHT_YELLOW) 
+            lv_label_set_text(lbl_mode, "Luz: SOLAR (Amarelo)");
+        else 
+            lv_label_set_text(lbl_mode, "Luz: UV (Azul)");
+            
+        xSemaphoreGive(xStateMutex);
+        
+        // Publicar Telemetria a cada atualização de UI (aprox 500ms é muito rápido, melhor filtrar)
+        static int count = 0;
+        if(++count > 10) { // A cada 5 seg
+            count = 0;
+            char msg[64];
+            sprintf(msg, "Temp:%d Hum:%d Duty:%d", g_state.current_temp, g_state.current_hum, g_state.pwm_intensity);
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_DATA, msg, 0, 0, 0);
+        }
+    }
+}
+
+void create_gui(lv_display_t *disp) {
+    lv_obj_t *scr = lv_display_get_screen_active(disp);
+    
+    lbl_clock = lv_label_create(scr);
+    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 0);
+    
+    lbl_temp = lv_label_create(scr);
+    lv_obj_align(lbl_temp, LV_ALIGN_TOP_MID, 0, 15);
+    
+    lbl_target = lv_label_create(scr);
+    lv_obj_align(lbl_target, LV_ALIGN_TOP_MID, 0, 30);
+
+    lbl_mode = lv_label_create(scr);
+    lv_obj_align(lbl_mode, LV_ALIGN_TOP_MID, 0, 45);
 }
 
 static void lvgl_port_task(void *arg) {
-    ESP_LOGI(TAG6, "Starting LVGL task");
-    uint32_t time_till_next_ms = 0;
     while (1) {
         _lock_acquire(&lvgl_api_lock);
-        time_till_next_ms = lv_timer_handler();
+        lv_timer_handler();
         _lock_release(&lvgl_api_lock);
-        
-        time_till_next_ms = MAX(time_till_next_ms, EXAMPLE_LVGL_TASK_MIN_DELAY_MS);
-        time_till_next_ms = MIN(time_till_next_ms, EXAMPLE_LVGL_TASK_MAX_DELAY_MS);
-        usleep(1000 * time_till_next_ms);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-}
-
-static void update_ui_callback(lv_timer_t *timer) {
-    real_time_clock_t current_rtc = g_rtc;
-    adc_data_t current_adc = g_adc_data;
-    lv_label_set_text_fmt(label_time, "Hora: %02d:%02d:%02d", current_rtc.hour, current_rtc.minute, current_rtc.second);
-    lv_label_set_text_fmt(label_voltage, "ADC: %d mV", current_adc.voltage);
-}
-
-static void create_demo_ui(lv_display_t *disp) {
-    lv_obj_t *scr = lv_display_get_screen_active(disp);
-    label_time = lv_label_create(scr);
-    lv_label_set_text(label_time, "Hora: --:--:--");
-    lv_obj_align(label_time, LV_ALIGN_TOP_MID, 0, 10);
-
-    label_voltage = lv_label_create(scr);
-    lv_label_set_text(label_voltage, "ADC: ---- mV");
-    lv_obj_align(label_voltage, LV_ALIGN_TOP_MID, 0, 30);
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG1, "Iniciando Pratica 07...");
-    //Inicialização de Wi-Fi e Flash
+    // 1. Inicializações de Sistema
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    xStateMutex = xSemaphoreCreateMutex();
+
     ESP_ERROR_CHECK(example_connect());
-
-    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
-    xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
-    gpio_install_isr_service(0);
-    uint64_t pin_bit_mask = 0;
-    for (int i = 0; i < NUM_BUTTONS; i++) {
-        pin_bit_mask |= (1ULL << buttons[i].gpio_num);
-        buttons[i].timer_handle = xTimerCreate("btn", pdMS_TO_TICKS(DEBOUNCE_DELAY_MS), pdFALSE, (void*) buttons[i].gpio_num, button_timer_callback);
-        gpio_isr_handler_add(buttons[i].gpio_num, gpio_isr_handler, (void*) buttons[i].gpio_num);
-    }
-    gpio_config_t io_conf = { .intr_type = GPIO_INTR_NEGEDGE, .pin_bit_mask = pin_bit_mask, .mode = GPIO_MODE_INPUT, .pull_up_en = 1 };
-    gpio_config(&io_conf);
-    gpio_reset_pin(LED_AZUL_GPIO); gpio_set_direction(LED_AZUL_GPIO, GPIO_MODE_OUTPUT);
-
-    gptimer_queue = xQueueCreate(5, sizeof(timer_event_t));
-    xTaskCreate(gptimer_task, "gptimer_task", 4096, NULL, 5, NULL);
-
-    pwm_sync_semaphore = xSemaphoreCreateBinary();
-    pwm_control_queue = xQueueCreate(5, sizeof(PWM_elements_t));
-    xTaskCreate(pwm_task, "pwm_task", 2048, NULL, 5, NULL);
-
-    adc_sync_semaphore = xSemaphoreCreateBinary();
-    adc_data_queue = xQueueCreate(5, sizeof(adc_data_t));
-    xTaskCreate(adc_task, "adc_task", 4096, NULL, 5, NULL);
-
-    //Inicia Cliente MQTT
+    
+    //3.Inicializa SNTP e MQTT
+    initialize_sntp();
     mqtt_app_start();
 
-    // Configuração Display I2C / LVGL
-    ESP_LOGI(TAG6, "Configurando Display...");
+    
+
+    // 4. Tasks de Controle
+    xTaskCreate(adc_task, "adc_task", 4096, NULL, 5, NULL);
+    xTaskCreate(control_task, "ctrl_task", 4096, NULL, 5, NULL);
+
+    // 5. Configuração do Display (SSD1306/SH1107 via I2C)
     i2c_master_bus_handle_t i2c_bus = NULL;
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = I2C_BUS_PORT,
-        .sda_io_num = EXAMPLE_PIN_NUM_SDA, // PINO 19
-        .scl_io_num = EXAMPLE_PIN_NUM_SCL, // PINO 18
+        .i2c_port = 0,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
         .flags.enable_internal_pullup = true,
         .glitch_ignore_cnt = 7,
     };
@@ -452,50 +343,44 @@ void app_main(void) {
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t io_config = {
-        .dev_addr = EXAMPLE_I2C_HW_ADDR,
-        .scl_speed_hz = EXAMPLE_LCD_PIXEL_CLOCK_HZ,
+        .dev_addr = 0x3C,
+        .scl_speed_hz = 400 * 1000,
         .control_phase_bytes = 1,
-        .lcd_cmd_bits = EXAMPLE_LCD_CMD_BITS,
-        .lcd_param_bits = EXAMPLE_LCD_CMD_BITS,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
         .dc_bit_offset = 6,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus, &io_config, &io_handle));
-
     esp_lcd_panel_handle_t panel_handle = NULL;
-    esp_lcd_panel_dev_config_t panel_config = { .bits_per_pixel = 1, .reset_gpio_num = EXAMPLE_PIN_NUM_RST };
-    esp_lcd_panel_ssd1306_config_t ssd1306_config = { .height = EXAMPLE_LCD_V_RES };
-    panel_config.vendor_config = &ssd1306_config;
+    esp_lcd_panel_dev_config_t panel_config = { .bits_per_pixel = 1, .reset_gpio_num = -1 };
+    esp_lcd_panel_ssd1306_config_t ssd_cfg = { .height = LCD_V_RES };
+    panel_config.vendor_config = &ssd_cfg;
     ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io_handle, &panel_config, &panel_handle));
-
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
 
+    // 6. LVGL Init
     lv_init();
-    lv_display_t *display = lv_display_create(EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+    lv_display_t *display = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_user_data(display, panel_handle);
-    
-    size_t draw_buffer_sz = EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES / 8 + EXAMPLE_LVGL_PALETTE_SIZE;
-    void *buf = heap_caps_calloc(1, draw_buffer_sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    lv_display_set_color_format(display, LV_COLOR_FORMAT_I1);
-    lv_display_set_buffers(display, buf, NULL, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_FULL);
+    void *buf = heap_caps_malloc(LCD_H_RES * LCD_V_RES / 8, MALLOC_CAP_DMA);
+    lv_display_set_buffers(display, buf, NULL, LCD_H_RES * LCD_V_RES / 8, LV_DISPLAY_RENDER_MODE_FULL);
     lv_display_set_flush_cb(display, lvgl_flush_cb);
-
-    const esp_lcd_panel_io_callbacks_t cbs_io = { .on_color_trans_done = notify_lvgl_flush_ready };
-    esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs_io, display);
-
+    
+    // Timer LVGL
     const esp_timer_create_args_t lvgl_tick_timer_args = { .callback = &increase_lvgl_tick, .name = "lvgl_tick" };
     esp_timer_handle_t lvgl_tick_timer = NULL;
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, 5000));
 
-    xTaskCreate(lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
-
+    // GUI
     _lock_acquire(&lvgl_api_lock);
-    create_demo_ui(display);
-    lv_timer_create(update_ui_callback, 500, NULL);
+    create_gui(display);
+    lv_timer_create(update_ui_callback, 500, NULL); // Atualiza tela a cada 500ms
     _lock_release(&lvgl_api_lock);
+
+    xTaskCreate(lvgl_port_task, "LVGL", 4096, NULL, 2, NULL);
     
-    ESP_LOGI(TAG6, "Sistema Rodando (MQTT + Display + PWM + ADC).");
+    ESP_LOGI(TAG, "Estufa Iniciada com Sucesso.");
 }
